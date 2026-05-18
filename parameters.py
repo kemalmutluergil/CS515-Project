@@ -35,6 +35,7 @@ class TrainParams:
         batch_size: Mini-batch size (used for graph-classification datasets).
         patience: Number of epochs without validation improvement before
             early stopping triggers.  Set to ``0`` to disable.
+        pretrain_epochs: Number of unsupervised pre-training epochs (DGI only).
     """
 
     lr: float = 0.01
@@ -42,6 +43,7 @@ class TrainParams:
     epochs: int = 200
     batch_size: int = 32
     patience: int = 20
+    pretrain_epochs: int = 300
 
 
 @dataclass
