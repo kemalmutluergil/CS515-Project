@@ -14,6 +14,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from parameters import TrainParams
+from test import evaluate
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +181,127 @@ def train_one_epoch(
         return train_graph_classification(model, train_loader, optimizer, device)
     else:
         raise ValueError(f"Unknown task type: {task}")
+
+
+def train_model_full(
+    model: torch.nn.Module,
+    task: str,
+    train_params: TrainParams,
+    device: torch.device,
+    data: Data | None = None,
+    train_mask: Tensor | None = None,
+    val_mask: Tensor | None = None,
+    train_loader: DataLoader | None = None,
+    val_loader: DataLoader | None = None,
+    verbose: bool = True,
+) -> Tuple[torch.nn.Module, float]:
+    """Train a GNN model fully, including DGI pre-training and standard training with early stopping.
+
+    Args:
+        model (torch.nn.Module): The GNN model to train.
+        task (str): The classification task ("node" or "graph").
+        train_params (TrainParams): Hyperparameters for training.
+        device (torch.device): Device to place tensors and model on.
+        data (Optional[Data]): A single graph Data object (node task only).
+        train_mask (Optional[Tensor]): Boolean training mask (node task only).
+        val_mask (Optional[Tensor]): Boolean validation mask (node task only).
+        train_loader (Optional[DataLoader]): Mini-batch loader for training graphs (graph task only).
+        val_loader (Optional[DataLoader]): Mini-batch loader for validating graphs (graph task only).
+        verbose (bool): Whether to print epoch training logs (default is True).
+
+    Returns:
+        Tuple[torch.nn.Module, float]: The trained model with best validation weights and the best validation accuracy.
+    """
+    is_dgi = hasattr(model, "dgi")
+
+    # ── Phase 1: DGI unsupervised pre-training ───────────────────────
+    if is_dgi:
+        if verbose:
+            print("--- Phase 1: DGI Pre-training (unsupervised) ---")
+        pretrain_optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+        for epoch in range(1, train_params.pretrain_epochs + 1):
+            if task == "node":
+                assert data is not None
+                pt_loss = train_dgi_pretrain(model, data, pretrain_optimizer)
+            else:
+                assert train_loader is not None
+                pt_loss = train_dgi_pretrain_graph(
+                    model, train_loader, pretrain_optimizer, device
+                )
+            if verbose and (epoch % 50 == 0 or epoch == 1):
+                print(f"Epoch {epoch:>4d}  |  Pre-train Loss: {pt_loss:.4f}")
+
+        # Freeze encoder weights before linear evaluation
+        for param in model.dgi.encoder.parameters():
+            param.requires_grad = False
+        model.dgi.weight.requires_grad = False
+
+        optimizer = torch.optim.Adam(
+            model.classifier.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+        if verbose:
+            print("\n--- Phase 2: Linear Evaluation ---")
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+
+    # ── Training loop (Phase 2 for DGI; full training for others) ────
+    best_val_acc = 0.0
+    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+    epochs_without_improvement = 0
+
+    for epoch in range(1, train_params.epochs + 1):
+        # Train
+        loss = train_one_epoch(
+            model=model,
+            task=task,
+            optimizer=optimizer,
+            device=device,
+            data=data,
+            train_mask=train_mask,
+            train_loader=train_loader,
+        )
+
+        # Validate
+        val_metrics = evaluate(
+            model=model,
+            task=task,
+            device=device,
+            data=data,
+            mask=val_mask,
+            loader=val_loader,
+        )
+        val_acc = val_metrics["accuracy"]
+
+        if verbose and (epoch % 10 == 0 or epoch == 1):
+            print(
+                f"Epoch {epoch:>4d}  |  "
+                f"Train Loss: {loss:.4f}  |  "
+                f"Val Acc: {val_acc:.4f}"
+            )
+
+        # Early stopping check
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if train_params.patience > 0 and epochs_without_improvement >= train_params.patience:
+            if verbose:
+                print(f"\nEarly stopping at epoch {epoch} (patience={train_params.patience}).")
+            break
+
+    # ── Restore best model ───────────────────────────────────────────
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    return model, best_val_acc
