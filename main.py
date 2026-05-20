@@ -31,10 +31,10 @@ torch.serialization.add_safe_globals([
     GlobalStorage,
 ])
 
-from models import GCN, GraphSAGE
+from models import GCN, GraphSAGE, DGI, GIN
 from parameters import DataParams, ModelParams, TrainParams
 from test import evaluate
-from train import train_one_epoch
+from train import train_dgi_pretrain, train_dgi_pretrain_graph, train_one_epoch
 
 
 # ── Argument parsing ─────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="gcn",
-        choices=["gcn", "graphsage"],
+        choices=["gcn", "graphsage", "dgi", "gin"],
         help="GNN architecture to use.",
     )
     parser.add_argument(
@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Early-stopping patience (0 = disabled).",
+    )
+    parser.add_argument(
+        "--pretrain_epochs",
+        type=int,
+        default=300,
+        help="Unsupervised pre-training epochs (DGI only).",
     )
 
     # Data
@@ -146,6 +152,7 @@ def build_params(
         epochs=args.epochs,
         batch_size=args.batch_size,
         patience=args.patience,
+        pretrain_epochs=args.pretrain_epochs,
     )
     data_params = DataParams(
         dataset_name=args.dataset,
@@ -328,6 +335,10 @@ def build_model(
         return GCN(**kwargs)
     elif model_params.model_name == "graphsage":
         return GraphSAGE(**kwargs)
+    elif model_params.model_name == "dgi":
+        return DGI(**kwargs)
+    elif model_params.model_name == "gin":
+        return GIN(**kwargs)
     else:
         raise ValueError(f"Unknown model: {model_params.model_name}")
 
@@ -381,19 +392,51 @@ def main() -> None:
 
     # ── Build model ──────────────────────────────────────────────────
     model = build_model(model_params, num_features, num_classes, task).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=train_params.lr,
-        weight_decay=train_params.weight_decay,
-    )
 
     print(f"\nModel   : {model_params.model_name.upper()}")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Params  : {total_params:,}")
     print(f"Device  : {device}\n")
 
-    # ── Training loop ────────────────────────────────────────────────
+    # ── Phase 1: DGI unsupervised pre-training ───────────────────────
+    if model_params.model_name == "dgi":
+        print("--- Phase 1: DGI Pre-training (unsupervised) ---")
+        pretrain_optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+        for epoch in range(1, train_params.pretrain_epochs + 1):
+            if task == "node":
+                pt_loss = train_dgi_pretrain(model, data, pretrain_optimizer)
+            else:
+                pt_loss = train_dgi_pretrain_graph(
+                    model, train_loader, pretrain_optimizer, device
+                )
+            if epoch % 50 == 0 or epoch == 1:
+                print(f"Epoch {epoch:>4d}  |  Pre-train Loss: {pt_loss:.4f}")
+
+        # Freeze encoder weights before linear evaluation
+        for param in model.dgi.encoder.parameters():
+            param.requires_grad = False
+        model.dgi.weight.requires_grad = False
+
+        optimizer = torch.optim.Adam(
+            model.classifier.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+        print("\n--- Phase 2: Linear Evaluation ---")
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=train_params.lr,
+            weight_decay=train_params.weight_decay,
+        )
+
+    # ── Training loop (Phase 2 for DGI; full training for others) ────
     best_val_acc = 0.0
+    best_state = model.state_dict()
     epochs_without_improvement = 0
 
     for epoch in range(1, train_params.epochs + 1):
@@ -429,8 +472,8 @@ def main() -> None:
         # Early stopping check
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            epochs_without_improvement = 0
             best_state = model.state_dict()
+            epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
 

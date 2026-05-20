@@ -1,7 +1,7 @@
 """Training routines for node-level and graph-level classification.
 
 This module provides a unified ``train_one_epoch`` dispatcher as well as the
-underlying task-specific helpers.
+underlying task-specific helpers, plus DGI unsupervised pre-training functions.
 """
 
 from typing import Tuple
@@ -14,6 +14,64 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from parameters import TrainParams
+
+
+# ---------------------------------------------------------------------------
+# DGI unsupervised pre-training
+# ---------------------------------------------------------------------------
+
+def train_dgi_pretrain(
+    model: torch.nn.Module,
+    data: Data,
+    optimizer: Optimizer,
+) -> float:
+    """One unsupervised pre-training epoch for DGI on a single graph.
+
+    Args:
+        model: The DGI model.
+        data: A single PyG :class:`Data` object (node classification dataset).
+        optimizer: The optimizer instance.
+
+    Returns:
+        The pre-training loss for this epoch.
+    """
+    model.train()
+    optimizer.zero_grad()
+    loss = model.pretrain_loss(data.x, data.edge_index)
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
+def train_dgi_pretrain_graph(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    optimizer: Optimizer,
+    device: torch.device,
+) -> float:
+    """One unsupervised pre-training epoch for DGI on batched graphs.
+
+    Args:
+        model: The DGI model.
+        loader: A PyG :class:`DataLoader` yielding batched graphs.
+        optimizer: The optimizer instance.
+        device: Device to place tensors on.
+
+    Returns:
+        The mean pre-training loss for this epoch.
+    """
+    model.train()
+    total_loss = 0.0
+    total_graphs = 0
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        loss = model.pretrain_loss(batch.x, batch.edge_index, batch.batch)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * batch.num_graphs
+        total_graphs += batch.num_graphs
+    return total_loss / total_graphs
 
 
 # ---------------------------------------------------------------------------

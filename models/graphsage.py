@@ -85,3 +85,30 @@ class GraphSAGE(torch.nn.Module):
 
         x = self.classifier(x)
         return F.log_softmax(x, dim=-1)
+
+    @torch.no_grad()
+    def embed(
+        self,
+        x: Tensor,
+        edge_index: Tensor,
+        batch: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Return pre-classifier node/graph embeddings (no dropout).
+
+        Args:
+            x: Node feature matrix ``[num_nodes, in_channels]``.
+            edge_index: Edge index tensor ``[2, num_edges]``.
+            batch: Batch vector (graph task only).
+
+        Returns:
+            ``[num_nodes, hidden_channels]`` (node) or
+            ``[num_graphs, hidden_channels]`` (graph).
+        """
+        self.eval()
+        for conv in self.convs:
+            x = conv(x, edge_index)
+            x = F.relu(x)
+        if self.task == "graph":
+            assert batch is not None
+            x = global_mean_pool(x, batch)
+        return x

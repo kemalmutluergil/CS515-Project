@@ -1,7 +1,9 @@
-"""Graph Convolutional Network (GCN) model.
+"""Graph Isomorphism Network (GIN) model.
 
-Implements the architecture from Kipf & Welling (2017) with configurable
-depth.  Supports both node-level and graph-level classification.
+Implements the architecture from Xu et al. (2019) with configurable depth.
+Each message-passing layer wraps a 2-layer MLP, making GIN as expressive as
+the Weisfeiler-Lehman graph isomorphism test.  Supports both node-level and
+graph-level classification.
 """
 
 from typing import Optional
@@ -9,21 +11,31 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.nn import GINConv, global_mean_pool
 
 
-class GCN(torch.nn.Module):
-    """A multi-layer Graph Convolutional Network.
+def _mlp(in_channels: int, out_channels: int) -> torch.nn.Sequential:
+    """Two-layer MLP used inside each GINConv layer."""
+    return torch.nn.Sequential(
+        torch.nn.Linear(in_channels, out_channels),
+        torch.nn.BatchNorm1d(out_channels),
+        torch.nn.ReLU(),
+        torch.nn.Linear(out_channels, out_channels),
+    )
 
-    The model stacks *num_layers* ``GCNConv`` layers with ReLU activation
-    and dropout in between.  For graph-classification tasks an additional
+
+class GIN(torch.nn.Module):
+    """A multi-layer Graph Isomorphism Network.
+
+    The model stacks *num_layers* ``GINConv`` layers, each backed by a 2-layer
+    MLP with BatchNorm.  For graph-classification tasks an additional
     ``global_mean_pool`` readout followed by a linear classifier is used.
 
     Args:
         in_channels: Dimensionality of input node features.
         hidden_channels: Width of each hidden layer.
         out_channels: Number of output classes.
-        num_layers: Total number of ``GCNConv`` layers (≥ 2).
+        num_layers: Total number of ``GINConv`` layers (≥ 2).
         dropout: Dropout probability applied after each hidden layer.
         task: ``"node"`` for node classification or ``"graph"`` for
             graph classification.
@@ -46,15 +58,12 @@ class GCN(torch.nn.Module):
         self.dropout = dropout
 
         self.convs = torch.nn.ModuleList()
-        self.convs.append(GCNConv(in_channels, hidden_channels))
+        self.convs.append(GINConv(_mlp(in_channels, hidden_channels)))
         for _ in range(num_layers - 2):
-            self.convs.append(GCNConv(hidden_channels, hidden_channels))
-        self.convs.append(GCNConv(hidden_channels, hidden_channels))
+            self.convs.append(GINConv(_mlp(hidden_channels, hidden_channels)))
+        self.convs.append(GINConv(_mlp(hidden_channels, hidden_channels)))
 
-        if task == "graph":
-            self.classifier = torch.nn.Linear(hidden_channels, out_channels)
-        else:
-            self.classifier = torch.nn.Linear(hidden_channels, out_channels)
+        self.classifier = torch.nn.Linear(hidden_channels, out_channels)
 
     def forward(
         self,
